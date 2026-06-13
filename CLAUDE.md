@@ -79,10 +79,13 @@ project: 表示名            # 省略時はフォルダ名
 - 変更は `feature/<topic>` ブランチで行い、小さい単位でコミットする。コミットメッセージは命令形・1行サマリ＋必要なら本文。
 - **コミット前チェック**（最低限のスモークテスト）:
   ```
+  # 構文チェック
   python -c "import ast,sys; ast.parse(open('todo_dashboard.py',encoding='utf-8').read()); print('syntax OK')"
+  # ユニットテスト（parse/format ラウンドトリップ・update/delete/add・_check_target ガード）
+  python -m unittest discover -s tests -v
   ```
-  パーサを触ったら、§3 の3パターン（優先度＋期限あり / ネスト＋完了 / 優先度なし）で
-  `parse_task_line`→`format_task_line` が入力と一致することを確認する。
+  `tests/test_dashboard.py` が §3 の3パターン（優先度＋期限あり / ネスト＋完了 / 優先度なし）を
+  含む22ケースをカバーしている。パーサや書き込み関数を触ったら必ずテストを通すこと。
 - 仕様（§2〜§5）を変えたら、**この CLAUDE.md を同じコミットで更新**する。ドキュメントと実装を乖離させない。
 - 大きめの変更後は `/security-review` を実行して書き込みガード・入力エスケープの退行がないか確認する。
 - ロードマップは `TODO.md`（このリポジトリ直下）にある。着手前にユーザへ優先度の確認を取る。
