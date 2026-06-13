@@ -199,5 +199,89 @@ class TestFileMutations(unittest.TestCase):
         self.assertIn("- [ ] padded\n", self._read())
 
 
+# ---------------------------------------------------------------------------
+# parse_frontmatter — project + priority 抽出
+# ---------------------------------------------------------------------------
+
+class TestParseFrontmatter(unittest.TestCase):
+
+    def _fm(self, text):
+        return td.parse_frontmatter(text.splitlines())
+
+    def test_returns_project_and_priority(self):
+        fm = self._fm("---\nproject: MyApp\npriority: P2\n---\n")
+        self.assertEqual(fm["project"], "MyApp")
+        self.assertEqual(fm["priority"], "P2")
+
+    def test_priority_normalised_to_uppercase(self):
+        fm = self._fm("---\npriority: p3\n---\n")
+        self.assertEqual(fm["priority"], "P3")
+
+    def test_no_frontmatter_returns_none_values(self):
+        fm = self._fm("- [ ] task without frontmatter\n")
+        self.assertIsNone(fm["project"])
+        self.assertIsNone(fm["priority"])
+
+    def test_priority_missing_returns_none(self):
+        fm = self._fm("---\nproject: Foo\n---\n")
+        self.assertEqual(fm["project"], "Foo")
+        self.assertIsNone(fm["priority"])
+
+
+# ---------------------------------------------------------------------------
+# update_project_priority — フロントマター書き込み
+# ---------------------------------------------------------------------------
+
+class TestProjectPriority(unittest.TestCase):
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmpdir.name).resolve()
+        self._patch = patch.object(td, "ROOT", self.root)
+        self._patch.start()
+        self.todo = self.root / "proj" / "TODO.md"
+        self.todo.parent.mkdir(parents=True)
+
+    def tearDown(self):
+        self._patch.stop()
+        self._tmpdir.cleanup()
+
+    def _write(self, content):
+        self.todo.write_text(content, encoding="utf-8")
+
+    def _read(self):
+        return self.todo.read_text(encoding="utf-8")
+
+    def test_creates_frontmatter_when_absent(self):
+        """フロントマターなしのファイルに priority を書くと先頭に挿入される"""
+        self._write("- [ ] task\n")
+        td.update_project_priority(str(self.todo), "P1")
+        content = self._read()
+        self.assertIn("priority: P1", content)
+        self.assertTrue(content.startswith("---"))
+
+    def test_modifies_existing_priority(self):
+        """既存の priority: を別の値に更新できる"""
+        self._write("---\nproject: X\npriority: P3\n---\n- [ ] task\n")
+        td.update_project_priority(str(self.todo), "P1")
+        content = self._read()
+        self.assertIn("priority: P1", content)
+        self.assertNotIn("priority: P3", content)
+
+    def test_removes_priority_when_empty(self):
+        """空文字を渡すと priority 行が削除される"""
+        self._write("---\nproject: X\npriority: P2\n---\n- [ ] task\n")
+        td.update_project_priority(str(self.todo), "")
+        self.assertNotIn("priority:", self._read())
+
+    def test_rejects_invalid_priority(self):
+        """P1〜P4 以外は ValueError"""
+        self._write("---\nproject: X\n---\n")
+        with self.assertRaises(ValueError):
+            td.update_project_priority(str(self.todo), "P5")
+        with self.assertRaises(ValueError):
+            td.update_project_priority(str(self.todo), "high")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -36,6 +36,7 @@ python todo_dashboard.py --port 8765 --no-browser
 ```markdown
 ---
 project: 表示名            # 省略時はフォルダ名
+priority: P1               # 省略可。P1〜P4。UI から変更可能
 ---
 - [ ] (P1) タスク内容 <!-- due:2026-06-20 -->
 - [x] (P3) 完了タスク
@@ -61,6 +62,7 @@ project: 表示名            # 省略時はフォルダ名
   - `POST /api/update` … `{file, old_raw, new_raw}` で1行を置換
   - `POST /api/delete` … `{file, old_raw}` で1行を削除
   - `POST /api/add` … `{file, text, priority}` で末尾に1行追加
+  - `POST /api/update-project` … `{file, priority}` でフロントマターの `priority:` を更新
 - 書き戻しの同定方式: **行番号ではなく `old_raw` の完全一致**で対象行を探す（インデックスずれに強い）。
   元の行が見つからなければ保存せずエラーを返し、UI 側は再読込を促す。
 - 改行コード（CRLF/LF）は元の行のものを維持する。
@@ -85,7 +87,7 @@ project: 表示名            # 省略時はフォルダ名
   python -m unittest discover -s tests -v
   ```
   `tests/test_dashboard.py` が §3 の3パターン（優先度＋期限あり / ネスト＋完了 / 優先度なし）を
-  含む22ケースをカバーしている。パーサや書き込み関数を触ったら必ずテストを通すこと。
+  含む30ケースをカバーしている。パーサや書き込み関数を触ったら必ずテストを通すこと。
 - 仕様（§2〜§5）を変えたら、**この CLAUDE.md を同じコミットで更新**する。ドキュメントと実装を乖離させない。
 - 大きめの変更後は `/security-review` を実行して書き込みガード・入力エスケープの退行がないか確認する。
 - ロードマップは `TODO.md`（このリポジトリ直下）にある。着手前にユーザへ優先度の確認を取る。

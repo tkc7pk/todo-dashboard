@@ -93,16 +93,22 @@ def format_task_line(t):
 
 
 def parse_frontmatter(lines):
-    """先頭の YAML フロントマターから project を取り出す(無ければ None)。"""
+    """先頭の YAML フロントマターから project と priority を取り出す。
+    戻り値: {"project": str|None, "priority": str|None}
+    """
+    result = {"project": None, "priority": None}
     if not lines or lines[0].strip() != "---":
-        return None
+        return result
     for i in range(1, len(lines)):
         if lines[i].strip() == "---":
             break
         m = re.match(r"\s*project\s*:\s*(.+?)\s*$", lines[i])
         if m:
-            return m.group(1).strip().strip('"').strip("'")
-    return None
+            result["project"] = m.group(1).strip().strip('"').strip("'")
+        m2 = re.match(r"\s*priority\s*:\s*(P[1-4])\s*$", lines[i], re.IGNORECASE)
+        if m2:
+            result["priority"] = m2.group(1).upper()
+    return result
 
 
 # ---------- scanning ----------
@@ -137,9 +143,11 @@ def scan(root):
         except Exception:
             continue
         lines = raw.splitlines()
-        project = parse_frontmatter(lines) or f.parent.name
+        fm = parse_frontmatter(lines)
+        project = fm["project"] or f.parent.name
+        proj_priority = fm["priority"]
         rel = str(f.relative_to(root)) if str(f).startswith(str(root)) else str(f)
-        projects.append({"project": project, "file": str(f), "rel": rel})
+        projects.append({"project": project, "file": str(f), "rel": rel, "priority": proj_priority})
         for idx, line in enumerate(lines):
             t = parse_task_line(line)
             if t is None:
@@ -231,6 +239,50 @@ def add_task(file_str, text, priority):
     return new_line
 
 
+def update_project_priority(file_str, priority):
+    """TODO.md のフロントマターに priority: Pn を書き込む。
+    priority が空文字または None のときは priority 行を削除（未設定）。
+    """
+    if priority and not re.match(r"^P[1-4]$", priority, re.IGNORECASE):
+        raise ValueError(f"priority は P1〜P4 で指定してください: {priority!r}")
+    priority = priority.upper() if priority else ""
+
+    p = _check_target(file_str)
+    content = p.read_text(encoding="utf-8", errors="replace")
+    lines = content.splitlines(keepends=True)
+
+    # フロントマターの範囲を探す
+    if lines and lines[0].strip() == "---":
+        close = None
+        for i in range(1, len(lines)):
+            if lines[i].strip() == "---":
+                close = i
+                break
+        if close is not None:
+            # フロントマターあり → priority 行を更新/挿入/削除
+            pri_idx = None
+            for i in range(1, close):
+                if re.match(r"\s*priority\s*:", lines[i]):
+                    pri_idx = i
+                    break
+            if priority:
+                new_pri_line = f"priority: {priority}\n"
+                if pri_idx is not None:
+                    lines[pri_idx] = new_pri_line
+                else:
+                    lines.insert(close, new_pri_line)
+            else:
+                if pri_idx is not None:
+                    del lines[pri_idx]
+            p.write_text("".join(lines), encoding="utf-8")
+            return
+
+    # フロントマターなし → 先頭に新規ブロックを挿入
+    if priority:
+        header = f"---\npriority: {priority}\n---\n"
+        p.write_text(header + content, encoding="utf-8")
+
+
 # ---------- HTTP handler ----------
 
 class Handler(BaseHTTPRequestHandler):
@@ -281,6 +333,9 @@ class Handler(BaseHTTPRequestHandler):
             elif self.path == "/api/add":
                 new_line = add_task(body["file"], body["text"], body.get("priority"))
                 self._send_json({"ok": True, "new_raw": new_line})
+            elif self.path == "/api/update-project":
+                update_project_priority(body["file"], body.get("priority", ""))
+                self._send_json({"ok": True})
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -409,11 +464,50 @@ PAGE = r"""<!doctype html>
   details.analysis pre{margin:0;padding:0 16px 16px;font-family:var(--mono);font-size:12.5px;
                        color:var(--text);white-space:pre-wrap;line-height:1.6}
 
+  body{display:flex;align-items:flex-start}
+
+  #sidebar{
+    width:220px;flex:0 0 220px;min-height:100vh;
+    background:var(--surface);border-right:1px solid var(--border);
+    display:flex;flex-direction:column;position:sticky;top:0;overflow-y:auto;
+  }
+  .sb-head{
+    padding:18px 14px 10px;font-size:11px;font-weight:700;letter-spacing:.1em;
+    text-transform:uppercase;color:var(--muted);border-bottom:1px solid var(--border-soft);
+  }
+  .sb-all{
+    padding:10px 12px 6px;display:flex;align-items:center;gap:8px;
+    cursor:pointer;border-radius:7px;margin:6px 8px 2px;
+    font-size:13px;color:var(--muted);transition:background .1s;
+  }
+  .sb-all:hover,.sb-all.on{background:var(--raised);color:var(--text)}
+  .sb-item{
+    padding:7px 12px;margin:2px 8px;border-radius:7px;cursor:pointer;
+    display:flex;flex-direction:column;gap:4px;transition:background .1s;
+  }
+  .sb-item:hover{background:var(--surface-2)}
+  .sb-item.on{background:var(--raised)}
+  .sb-name{font-size:13px;color:var(--text);word-break:break-all;line-height:1.3}
+  .sb-pri{display:flex;align-items:center;gap:6px;margin-top:2px}
+  .sb-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+  .sb-sel{
+    font-family:var(--mono);font-size:11px;background:var(--surface-2);
+    color:var(--muted);border:1px solid var(--border);border-radius:5px;
+    padding:2px 4px;cursor:pointer;
+  }
+  .sb-sel:hover{border-color:#36404f}
+  .wrap{flex:1;min-width:0}
+
   @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+  @media (max-width:700px){#sidebar{display:none}}
   @media (max-width:600px){.src{display:none}}
 </style>
 </head>
 <body>
+<aside id="sidebar">
+  <div class="sb-head">プロジェクト</div>
+  <div id="sb-list"></div>
+</aside>
 <div class="wrap">
   <header>
     <h1><span class="dot"></span>TODO ダッシュボード</h1>
@@ -427,7 +521,7 @@ PAGE = r"""<!doctype html>
 
   <div class="controls">
     <input type="text" id="search" placeholder="タスクを検索…">
-    <select id="project"><option value="">すべてのプロジェクト</option></select>
+    <select id="project" style="display:none"><option value="">すべてのプロジェクト</option></select>
     <div class="seg" id="statusSeg">
       <button data-s="open" class="on">未完了</button>
       <button data-s="all">すべて</button>
@@ -488,6 +582,7 @@ async function load(){
     renderStats();
     render();
     renderAnalysis();
+    renderSidebar();
   }catch(e){ toast('読み込み失敗: '+e.message, true); }
 }
 
@@ -709,6 +804,67 @@ $('#copyPrompt').addEventListener('click', ()=>{
     ()=>toast('コピーに失敗しました', true)
   );
 });
+
+// ---- sidebar ----
+const PRI_META = {
+  P1:{color:'var(--p1)',label:'P1'},
+  P2:{color:'var(--p2)',label:'P2'},
+  P3:{color:'var(--p3)',label:'P3'},
+  P4:{color:'var(--p4)',label:'P4'},
+};
+
+function selectProject(name){
+  FILTER.project = name;
+  $('#project').value = name;
+  renderSidebar();
+  render();
+}
+
+function renderSidebar(){
+  const list = $('#sb-list');
+  const allActive = !FILTER.project;
+  let html = `<div class="sb-all${allActive?' on':''}" id="sb-all">すべて</div>`;
+  for(const p of DATA.projects){
+    const active = FILTER.project === p.project;
+    const pri = p.priority ? PRI_META[p.priority] : null;
+    const dot = pri
+      ? `<span class="sb-dot" style="background:${pri.color}"></span>`
+      : `<span class="sb-dot" style="background:var(--none)"></span>`;
+    const opts = ['','P1','P2','P3','P4'].map(v=>
+      `<option value="${v}" ${p.priority===v?'selected':''}>${v||'—'}</option>`
+    ).join('');
+    html += `<div class="sb-item${active?' on':''}" data-proj="${esc(p.project)}">
+      <div class="sb-name">${esc(p.project)}</div>
+      <div class="sb-pri">${dot}
+        <select class="sb-sel" data-file="${esc(p.file)}" data-proj="${esc(p.project)}"
+                title="プロジェクト優先度">${opts}</select>
+      </div>
+    </div>`;
+  }
+  list.innerHTML = html;
+
+  $('#sb-all').addEventListener('click', ()=>selectProject(''));
+  list.querySelectorAll('.sb-item').forEach(el=>{
+    el.addEventListener('click', e=>{
+      if(e.target.classList.contains('sb-sel')) return;
+      selectProject(el.dataset.proj);
+    });
+  });
+  list.querySelectorAll('.sb-sel').forEach(sel=>{
+    sel.addEventListener('change', async e=>{
+      e.stopPropagation();
+      const file = sel.dataset.file;
+      const priority = sel.value;
+      try{
+        await api('/api/update-project', {file, priority});
+        const proj = DATA.projects.find(p=>p.file===file);
+        if(proj) proj.priority = priority || null;
+        renderSidebar();
+        toast('プロジェクト優先度を更新しました');
+      }catch(err){ toast('更新失敗: '+err.message, true); }
+    });
+  });
+}
 
 load();
 </script>
