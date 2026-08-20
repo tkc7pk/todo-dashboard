@@ -119,6 +119,26 @@ class TestCheckTarget(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# cf_access_ok — Cloudflare Access ガード
+# ---------------------------------------------------------------------------
+
+class TestCfAccessGuard(unittest.TestCase):
+
+    def test_not_required_always_allows(self):
+        """required=False（ローカル利用の既定）なら常に許可される"""
+        self.assertTrue(td.cf_access_ok({}, False))
+
+    def test_required_without_header_is_denied(self):
+        """required=True かつヘッダー無しは拒否される"""
+        self.assertFalse(td.cf_access_ok({}, True))
+
+    def test_required_with_header_is_allowed(self):
+        """required=True でも Cf-Access-Jwt-Assertion ヘッダーがあれば許可される"""
+        headers = {"Cf-Access-Jwt-Assertion": "dummy-token"}
+        self.assertTrue(td.cf_access_ok(headers, True))
+
+
+# ---------------------------------------------------------------------------
 # update_line / delete_line / add_task ファイル操作
 # ---------------------------------------------------------------------------
 
@@ -281,6 +301,96 @@ class TestProjectPriority(unittest.TestCase):
             td.update_project_priority(str(self.todo), "P5")
         with self.assertRaises(ValueError):
             td.update_project_priority(str(self.todo), "high")
+
+
+# ---------------------------------------------------------------------------
+# build_discord_summary
+# ---------------------------------------------------------------------------
+
+class TestBuildDiscordSummary(unittest.TestCase):
+
+    def _make_data(self, tasks, stats=None):
+        if stats is None:
+            open_count = sum(1 for t in tasks if not t["checked"])
+            done_count = sum(1 for t in tasks if t["checked"])
+            stats = {
+                "open": open_count, "done": done_count,
+                "p1": 0, "p2": 0, "p3": 0, "p4": 0, "none": 0,
+            }
+            for t in tasks:
+                if not t["checked"]:
+                    key = f"p{t['priority']}" if t["priority"] else "none"
+                    stats[key] += 1
+        return {"root": ".", "projects": [], "tasks": tasks, "analysis": None, "stats": stats}
+
+    def _task(self, priority, text, project="proj", checked=False, due=None):
+        return {
+            "id": f"fake::{text}",
+            "project": project,
+            "file": "fake/TODO.md",
+            "lineno": 0,
+            "checked": checked,
+            "priority": priority,
+            "text": text,
+            "due": due,
+            "raw": "",
+        }
+
+    def test_contains_header(self):
+        data = self._make_data([])
+        result = td.build_discord_summary(data)
+        self.assertIn("TODO Dashboard", result)
+
+    def test_p1_task_shown_with_detail(self):
+        data = self._make_data([self._task(1, "緊急タスク")])
+        result = td.build_discord_summary(data)
+        self.assertIn("🔴", result)
+        self.assertIn("緊急タスク", result)
+        self.assertIn("proj", result)
+
+    def test_p2_task_shown_with_detail(self):
+        data = self._make_data([self._task(2, "重要タスク")])
+        result = td.build_discord_summary(data)
+        self.assertIn("🟠", result)
+        self.assertIn("重要タスク", result)
+
+    def test_p3_p4_count_only(self):
+        tasks = [self._task(3, "中程度"), self._task(4, "低優先")]
+        data = self._make_data(tasks)
+        result = td.build_discord_summary(data)
+        self.assertIn("🟡", result)
+        self.assertIn("🔵", result)
+        self.assertNotIn("中程度", result)
+        self.assertNotIn("低優先", result)
+
+    def test_due_date_shown(self):
+        data = self._make_data([self._task(1, "期限あり", due="2026-07-01")])
+        result = td.build_discord_summary(data)
+        self.assertIn("2026-07-01", result)
+
+    def test_checked_tasks_excluded(self):
+        data = self._make_data([self._task(1, "完了タスク", checked=True)])
+        result = td.build_discord_summary(data)
+        self.assertNotIn("完了タスク", result)
+
+    def test_stats_line(self):
+        tasks = [self._task(1, "open1"), self._task(2, "done1", checked=True)]
+        data = self._make_data(tasks)
+        result = td.build_discord_summary(data)
+        self.assertIn("合計: 2件", result)
+        self.assertIn("完了: 1件", result)
+        self.assertIn("未完了: 1件", result)
+
+    def test_p1_capped_at_5(self):
+        tasks = [self._task(1, f"task{i}") for i in range(7)]
+        data = self._make_data(tasks)
+        result = td.build_discord_summary(data)
+        self.assertIn("他 2件", result)
+
+    def test_no_tasks(self):
+        data = self._make_data([])
+        result = td.build_discord_summary(data)
+        self.assertIn("合計: 0件", result)
 
 
 if __name__ == "__main__":

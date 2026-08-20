@@ -28,7 +28,10 @@ import json
 import os
 import re
 import threading
+import urllib.error
+import urllib.request
 import webbrowser
+from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -42,6 +45,7 @@ PRI_RE = re.compile(r"^\(\s*[Pp](?P<n>[1-4])\s*\)\s*")
 DUE_RE = re.compile(r"\s*<!--\s*due:\s*(?P<due>\d{4}-\d{2}-\d{2})\s*-->\s*")
 
 ROOT = Path(".").resolve()
+REQUIRE_CF_ACCESS = False
 
 
 # ---------- parsing / formatting ----------
@@ -189,6 +193,21 @@ def scan(root):
     }
 
 
+# ---------- Cloudflare Access ガード ----------
+
+def cf_access_ok(headers, required):
+    """Cloudflare Access 経由のリクエストか判定する（ヘッダー存在チェックのみ・署名検証はしない）。
+
+    required=False（既定）なら常に True でローカル利用時の挙動は変えない。
+    このツール自体にログイン機能を実装するわけではなく、Cloudflare Tunnel + Access で
+    エッジ側の認証を済ませたリクエストにだけ Cf-Access-Jwt-Assertion ヘッダーが付く前提で、
+    Tunnel を経由しない誤アクセス（設定ミス等）を弾くための保険。
+    """
+    if not required:
+        return True
+    return bool(headers.get("Cf-Access-Jwt-Assertion"))
+
+
 # ---------- safe file mutations ----------
 
 def _check_target(file_str):
@@ -310,6 +329,10 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(length).decode("utf-8")) if length else {}
 
     def do_GET(self):
+        if not cf_access_ok(self.headers, REQUIRE_CF_ACCESS):
+            self.send_response(403)
+            self.end_headers()
+            return
         if self.path == "/" or self.path.startswith("/?"):
             self._send_html(PAGE)
         elif self.path == "/api/scan":
@@ -322,6 +345,10 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
+        if not cf_access_ok(self.headers, REQUIRE_CF_ACCESS):
+            self.send_response(403)
+            self.end_headers()
+            return
         try:
             body = self._body()
             if self.path == "/api/update":
@@ -873,23 +900,133 @@ load();
 """
 
 
+# ---------- Discord notification ----------
+
+_PRI_LABELS = {
+    1: ("🔴", "P1"),
+    2: ("🟠", "P2"),
+    3: ("🟡", "P3"),
+    4: ("🔵", "P4"),
+    None: ("⚪", "未設定"),
+}
+
+
+def build_discord_summary(data):
+    """scan()の返り値からDiscord投稿用テキストを生成する。"""
+    today = date.today().isoformat()
+    stats = data["stats"]
+    tasks = data["tasks"]
+
+    by_pri = {1: [], 2: [], 3: [], 4: [], None: []}
+    for t in tasks:
+        if t["checked"]:
+            continue
+        key = t["priority"] if t["priority"] in by_pri else None
+        by_pri[key].append(t)
+
+    lines = [f"📋 **TODO Dashboard** — {today}", "─" * 32]
+
+    for pri_key in [1, 2, 3, 4, None]:
+        items = by_pri[pri_key]
+        if not items:
+            continue
+        emoji, label = _PRI_LABELS[pri_key]
+        lines.append(f"{emoji} **{label}** ({len(items)}件)")
+        if pri_key in (1, 2):
+            for t in items[:5]:
+                due_str = f" ⏰{t['due']}" if t.get("due") else ""
+                lines.append(f"  • {t['project']}: {t['text']}{due_str}")
+            if len(items) > 5:
+                lines.append(f"  … 他 {len(items) - 5}件")
+
+    total = stats["open"] + stats["done"]
+    lines.append("")
+    lines.append(f"📊 合計: {total}件 | 完了: {stats['done']}件 | 未完了: {stats['open']}件")
+    return "\n".join(lines)
+
+
+_DISCORD_LIMIT = 1900  # Discord is 2000 chars; leave margin for safety
+
+
+def post_discord(webhook_url, text):
+    """Discord Webhook にテキストを POST する（stdlib のみ）。"""
+    if not webhook_url:
+        raise ValueError(
+            "Discord Webhook URL が未設定です。\n"
+            "環境変数 DISCORD_WEBHOOK を設定するか --discord-webhook を指定してください。\n"
+            "Webhook URL は Discord チャンネル設定 > 連携サービス > ウェブフック で取得できます。"
+        )
+    # discordapp.com は旧ドメイン。POST リダイレクトが失敗するため正規化する
+    webhook_url = webhook_url.replace("discordapp.com", "discord.com")
+    if len(text) > _DISCORD_LIMIT:
+        text = text[:_DISCORD_LIMIT] + "\n…（省略）"
+    payload = json.dumps({"content": text}).encode("utf-8")
+    req = urllib.request.Request(
+        webhook_url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "DiscordBot (todo-dashboard, 1.0)",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            if resp.status not in (200, 204):
+                raise RuntimeError(f"Discord Webhook エラー: HTTP {resp.status}")
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = "(レスポンス取得失敗)"
+        msg = {
+            403: "Webhook URL が無効か削除されています。Discordで新しいWebhookを作成してください。",
+            404: "Webhook が見つかりません（削除済みの可能性）。新しいWebhookを作成してください。",
+            400: "メッセージ形式エラー（不正なペイロード）。",
+            429: "レート制限に達しました。しばらく待ってから再試行してください。",
+        }.get(e.code, f"HTTP {e.code}: {e.reason}")
+        raise RuntimeError(f"Discord 送信失敗: {msg}\nDiscord応答: {body}") from e
+
+
 def main():
-    global ROOT
+    global ROOT, REQUIRE_CF_ACCESS
     ap = argparse.ArgumentParser(description="Claude Code プロジェクト横断 TODO ダッシュボード")
     ap.add_argument("--root", default=".", help="スキャン起点(デフォルト: カレントディレクトリ)")
     ap.add_argument("--port", type=int, default=8765)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--no-browser", action="store_true", help="ブラウザを自動で開かない")
+    ap.add_argument("--notify", action="store_true",
+                    help="TODOサマリーをDiscordに送信して終了（HTTPサーバーは起動しない）")
+    ap.add_argument("--discord-webhook", metavar="URL",
+                    help="Discord Webhook URL（省略時は環境変数 DISCORD_WEBHOOK を使用）")
+    ap.add_argument("--require-cf-access", action="store_true",
+                    help="Cloudflare Access(Cf-Access-Jwt-Assertionヘッダー)が無いリクエストを403で拒否する"
+                         "（Cloudflare Tunnel経由で外部公開する場合に指定。ローカル利用時は付けない）")
     args = ap.parse_args()
 
     ROOT = Path(args.root).resolve()
     if not ROOT.exists():
         raise SystemExit(f"起点ディレクトリが存在しません: {ROOT}")
 
+    REQUIRE_CF_ACCESS = args.require_cf_access
+
+    if args.notify:
+        webhook_url = args.discord_webhook or os.environ.get("DISCORD_WEBHOOK", "")
+        data = scan(ROOT)
+        text = build_discord_summary(data)
+        try:
+            post_discord(webhook_url, text)
+            print("Discord に送信しました。")
+        except (ValueError, RuntimeError) as e:
+            raise SystemExit(f"エラー: {e}")
+        return
+
     url = f"http://{args.host}:{args.port}/"
     print(f"  TODO ダッシュボード")
     print(f"  起点 : {ROOT}")
     print(f"  URL  : {url}")
+    if REQUIRE_CF_ACCESS:
+        print(f"  認証 : Cloudflare Access ヘッダー必須（--require-cf-access）")
     print(f"  停止 : Ctrl+C")
     print()
 
