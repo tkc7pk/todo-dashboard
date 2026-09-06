@@ -97,10 +97,10 @@ def format_task_line(t):
 
 
 def parse_frontmatter(lines):
-    """先頭の YAML フロントマターから project と priority を取り出す。
-    戻り値: {"project": str|None, "priority": str|None}
+    """先頭の YAML フロントマターから project / priority / goal を取り出す。
+    戻り値: {"project": str|None, "priority": str|None, "goal": str|None}
     """
-    result = {"project": None, "priority": None}
+    result = {"project": None, "priority": None, "goal": None}
     if not lines or lines[0].strip() != "---":
         return result
     for i in range(1, len(lines)):
@@ -112,6 +112,9 @@ def parse_frontmatter(lines):
         m2 = re.match(r"\s*priority\s*:\s*(P[1-4])\s*$", lines[i], re.IGNORECASE)
         if m2:
             result["priority"] = m2.group(1).upper()
+        m3 = re.match(r"\s*goal\s*:\s*(.+?)\s*$", lines[i])
+        if m3:
+            result["goal"] = m3.group(1).strip().strip('"').strip("'")
     return result
 
 
@@ -138,7 +141,32 @@ def find_analysis(root):
     return None
 
 
+def _empty_stats():
+    return {"total": 0, "open": 0, "done": 0,
+            "p1": 0, "p2": 0, "p3": 0, "p4": 0, "none": 0, "overdue": 0}
+
+
+def _tally(stats, task, today_str):
+    """タスク1件を stats に加算する（全体集計・プロジェクト集計で共用）。"""
+    stats["total"] += 1
+    if task["checked"]:
+        stats["done"] += 1
+        return
+    stats["open"] += 1
+    stats[f"p{task['priority']}" if task["priority"] else "none"] += 1
+    if task["due"] and task["due"] < today_str:
+        stats["overdue"] += 1
+
+
+def _project_sort_key(p):
+    """全体TODO(root直下) を先頭、次にプロジェクト優先度(未設定は最後)、最後に名前順。"""
+    pri = int(p["priority"][1]) if p["priority"] else 9
+    return (0 if p["is_root"] else 1, pri, p["project"])
+
+
 def scan(root):
+    root = Path(root)
+    today_str = date.today().isoformat()
     projects = []
     tasks = []
     for f in sorted(iter_todo_files(root)):
@@ -149,9 +177,16 @@ def scan(root):
         lines = raw.splitlines()
         fm = parse_frontmatter(lines)
         project = fm["project"] or f.parent.name
-        proj_priority = fm["priority"]
         rel = str(f.relative_to(root)) if str(f).startswith(str(root)) else str(f)
-        projects.append({"project": project, "file": str(f), "rel": rel, "priority": proj_priority})
+        projects.append({
+            "project": project,
+            "file": str(f),
+            "rel": rel,
+            "priority": fm["priority"],
+            "goal": fm["goal"],
+            "is_root": f.parent.resolve() == root.resolve(),
+            "stats": _empty_stats(),
+        })
         for idx, line in enumerate(lines):
             t = parse_task_line(line)
             if t is None:
@@ -165,25 +200,28 @@ def scan(root):
                 "priority": t["priority"],
                 "text": t["text"],
                 "due": t["due"],
+                "indent": t["indent"],
+                "bullet": t["bullet"],
                 "raw": line,
             })
-    # de-dup project list, keep order
-    seen = set()
+    # de-dup project list（表示名で一意化・file は先勝ち）
+    seen = {}
     uniq_projects = []
     for p in projects:
         if p["project"] in seen:
             continue
-        seen.add(p["project"])
+        seen[p["project"]] = p
         uniq_projects.append(p)
 
-    stats = {"open": 0, "done": 0, "p1": 0, "p2": 0, "p3": 0, "p4": 0, "none": 0}
+    stats = _empty_stats()
     for t in tasks:
-        if t["checked"]:
-            stats["done"] += 1
-        else:
-            stats["open"] += 1
-            key = f"p{t['priority']}" if t["priority"] else "none"
-            stats[key] += 1
+        _tally(stats, t, today_str)
+        # 同名プロジェクトが複数ファイルにまたがっても件数が合うよう名前で合算する
+        proj = seen.get(t["project"])
+        if proj is not None:
+            _tally(proj["stats"], t, today_str)
+
+    uniq_projects.sort(key=_project_sort_key)
     return {
         "root": str(root),
         "projects": uniq_projects,
@@ -258,17 +296,16 @@ def add_task(file_str, text, priority):
     return new_line
 
 
-def update_project_priority(file_str, priority):
-    """TODO.md のフロントマターに priority: Pn を書き込む。
-    priority が空文字または None のときは priority 行を削除（未設定）。
+def _update_frontmatter_field(file_str, key, value):
+    """TODO.md のフロントマターの `key: value` を更新/挿入する。
+    value が空文字または None のときはその行を削除（未設定）。
+    フロントマターが無ければ、値がある場合に限り先頭に新規ブロックを挿入する。
     """
-    if priority and not re.match(r"^P[1-4]$", priority, re.IGNORECASE):
-        raise ValueError(f"priority は P1〜P4 で指定してください: {priority!r}")
-    priority = priority.upper() if priority else ""
-
+    value = value or ""
     p = _check_target(file_str)
     content = p.read_text(encoding="utf-8", errors="replace")
     lines = content.splitlines(keepends=True)
+    key_re = re.compile(r"\s*" + re.escape(key) + r"\s*:")
 
     # フロントマターの範囲を探す
     if lines and lines[0].strip() == "---":
@@ -278,28 +315,48 @@ def update_project_priority(file_str, priority):
                 close = i
                 break
         if close is not None:
-            # フロントマターあり → priority 行を更新/挿入/削除
-            pri_idx = None
+            # フロントマターあり → 該当行を更新/挿入/削除
+            idx = None
             for i in range(1, close):
-                if re.match(r"\s*priority\s*:", lines[i]):
-                    pri_idx = i
+                if key_re.match(lines[i]):
+                    idx = i
                     break
-            if priority:
-                new_pri_line = f"priority: {priority}\n"
-                if pri_idx is not None:
-                    lines[pri_idx] = new_pri_line
+            if value:
+                new_line = f"{key}: {value}\n"
+                if idx is not None:
+                    lines[idx] = new_line
                 else:
-                    lines.insert(close, new_pri_line)
-            else:
-                if pri_idx is not None:
-                    del lines[pri_idx]
+                    lines.insert(close, new_line)
+            elif idx is not None:
+                del lines[idx]
             p.write_text("".join(lines), encoding="utf-8")
             return
 
     # フロントマターなし → 先頭に新規ブロックを挿入
-    if priority:
-        header = f"---\npriority: {priority}\n---\n"
+    if value:
+        header = f"---\n{key}: {value}\n---\n"
         p.write_text(header + content, encoding="utf-8")
+
+
+def update_project_priority(file_str, priority):
+    """TODO.md のフロントマターに priority: Pn を書き込む。
+    priority が空文字または None のときは priority 行を削除（未設定）。
+    """
+    if priority and not re.match(r"^P[1-4]$", priority, re.IGNORECASE):
+        raise ValueError(f"priority は P1〜P4 で指定してください: {priority!r}")
+    _update_frontmatter_field(file_str, "priority", priority.upper() if priority else "")
+
+
+def update_project_goal(file_str, goal):
+    """TODO.md のフロントマターに goal: <一行テキスト> を書き込む。
+    goal が空文字または None のときは goal 行を削除（未設定）。
+    """
+    goal = (goal or "").strip()
+    if "\n" in goal or "\r" in goal:
+        raise ValueError("ゴールは改行を含められません")
+    if len(goal) > 200:
+        raise ValueError("ゴールは200文字以内で入力してください")
+    _update_frontmatter_field(file_str, "goal", goal)
 
 
 # ---------- HTTP handler ----------
@@ -362,6 +419,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True, "new_raw": new_line})
             elif self.path == "/api/update-project":
                 update_project_priority(body["file"], body.get("priority", ""))
+                self._send_json({"ok": True})
+            elif self.path == "/api/update-project-goal":
+                update_project_goal(body["file"], body.get("goal", ""))
                 self._send_json({"ok": True})
             else:
                 self.send_response(404)
@@ -523,7 +583,45 @@ PAGE = r"""<!doctype html>
     padding:2px 4px;cursor:pointer;
   }
   .sb-sel:hover{border-color:#36404f}
+  .sb-pri{position:relative}
+  .sb-open-count{font-family:var(--mono);font-size:10.5px;color:var(--faint);margin-left:auto}
+  .sb-bar{margin-top:5px;height:3px;background:var(--raised);border-radius:2px;overflow:hidden}
+  .sb-bar-fill{height:100%;background:var(--accent);border-radius:2px}
   .wrap{flex:1;min-width:0}
+
+  /* ---- 概要ビュー(プロジェクトカード) ---- */
+  .ov-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:10px;margin-bottom:18px}
+  .ov-card{position:relative;display:flex;background:var(--surface);border:1px solid var(--border-soft);
+           border-radius:8px;overflow:hidden;cursor:pointer;transition:background .12s,border-color .12s}
+  .ov-card:hover{background:var(--surface-2);border-color:#323c4b}
+  .ov-card.ov-root{grid-column:1/-1}
+  .ov-spine{width:4px;flex:0 0 auto;align-self:stretch}
+  .ov-body{flex:1;min-width:0;padding:12px 14px}
+  .ov-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+  .ov-name{font-size:14px;font-weight:650;color:var(--text)}
+  .ov-goal{margin:5px -3px 0;font-size:12px;color:var(--muted);cursor:text;border-radius:4px;padding:1px 3px}
+  .ov-goal:hover{background:var(--raised)}
+  .ov-goal-empty{color:var(--faint)}
+  .ov-goal-input{font-family:var(--sans);font-size:12px;color:var(--text);width:100%;
+                 background:var(--bg);border:1px solid var(--accent);border-radius:5px;padding:4px 6px}
+  .ov-progress{margin-top:9px;height:4px;background:var(--raised);border-radius:3px;overflow:hidden}
+  .ov-progress-bar{height:100%;background:var(--accent);border-radius:3px}
+  .ov-progress-label{margin-top:4px;font-size:11px;font-family:var(--mono);color:var(--faint)}
+  .ov-counts{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+  .ov-counts .badge{font-size:10.5px}
+  .ov-count-alert{color:var(--p1);border-color:var(--p1)}
+  .ov-preview{margin-top:8px;display:flex;flex-direction:column;gap:2px}
+  .ov-prev-item{font-family:var(--mono);font-size:12px;color:var(--text);white-space:nowrap;
+                overflow:hidden;text-overflow:ellipsis}
+  .ov-prev-empty{color:var(--faint);font-family:var(--sans)}
+
+  /* ---- 詳細ビュー ヘッダー ---- */
+  .proj-header{display:flex;align-items:center;gap:16px;margin:0 0 16px;padding:12px 14px;
+               background:var(--surface);border:1px solid var(--border-soft);border-radius:8px}
+  .proj-header-main{flex:1;min-width:0}
+  .proj-header-name{font-size:15px;font-weight:650;color:var(--text)}
+  .proj-header-goal{font-size:12px;color:var(--muted);margin-top:2px}
+  .proj-header .ov-progress{max-width:280px}
 
   @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
   @media (max-width:700px){#sidebar{display:none}}
@@ -539,6 +637,10 @@ PAGE = r"""<!doctype html>
   <header>
     <h1><span class="dot"></span>TODO ダッシュボード</h1>
     <span class="root" id="root">…</span>
+    <div class="seg" id="viewSeg">
+      <button data-v="overview" class="on">概要</button>
+      <button data-v="tasks">タスク</button>
+    </div>
     <span class="spacer"></span>
     <button class="btn" id="copyPrompt" title="全タスクを並べた優先度提案プロンプトをコピーします">Claude用プロンプトをコピー</button>
     <button class="btn primary" id="refresh">更新</button>
@@ -556,6 +658,7 @@ PAGE = r"""<!doctype html>
     </div>
   </div>
 
+  <div id="projHeader"></div>
   <div id="board"></div>
 
   <div class="addbar">
@@ -583,9 +686,27 @@ const PRIOS = [
 ];
 let DATA = {tasks:[], projects:[], stats:{}, root:''};
 let FILTER = {q:'', project:'', status:'open'};
+let VIEW = 'overview';  // 'overview' | 'tasks'
 
 const $ = s => document.querySelector(s);
 const esc = s => (s||'').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+// 指定プロジェクト(省略時は全体)の統計を DATA.tasks から都度計算する。
+// ローカルでの楽観更新(チェック/優先度変更)が即座にサイドバー・概要カードへ反映されるようにするため、
+// サーバから受け取った projects[].stats はキャッシュとしては使わず、常に再計算する。
+function statsFor(projectName){
+  const t0 = today();
+  const s = {total:0, open:0, done:0, p1:0, p2:0, p3:0, p4:0, none:0, overdue:0};
+  for(const t of DATA.tasks){
+    if(projectName && t.project !== projectName) continue;
+    s.total++;
+    if(t.checked){ s.done++; continue; }
+    s.open++;
+    if(t.priority) s['p'+t.priority]++; else s.none++;
+    if(t.due && t.due < t0) s.overdue++;
+  }
+  return s;
+}
 
 function toast(msg, isErr){
   const t = $('#toast'); t.textContent = msg;
@@ -606,10 +727,13 @@ async function load(){
     DATA = await api('/api/scan');
     $('#root').textContent = DATA.root;
     fillProjects();
-    renderStats();
+    restoreFromHash();
+    syncViewSeg();
+    updateHash();
     render();
     renderAnalysis();
     renderSidebar();
+    updateAddProjectSelection();
   }catch(e){ toast('読み込み失敗: '+e.message, true); }
 }
 
@@ -623,7 +747,8 @@ function fillProjects(){
 }
 
 function renderStats(){
-  const s = DATA.stats;
+  // 表示中のプロジェクト基準(概要ビュー、またはプロジェクト未選択のときは全体値)
+  const s = (VIEW==='overview' || !FILTER.project) ? statsFor(null) : statsFor(FILTER.project);
   const cell = (color,label,val)=>`<span class="stat"><span class="pill" style="background:${color}"></span>${label} <b>${val}</b></span>`;
   $('#stats').innerHTML =
     cell('var(--p1)','P1', s.p1) + cell('var(--p2)','P2', s.p2) +
@@ -664,7 +789,7 @@ function rowHTML(t){
   </div>`;
 }
 
-function render(){
+function renderTasks(){
   const board = $('#board');
   const shown = DATA.tasks.filter(visible);
   if(shown.length===0){ board.innerHTML = '<div class="empty">該当するタスクはありません。</div>'; return; }
@@ -682,11 +807,201 @@ function render(){
   wire();
 }
 
+// ---- 表示ディスパッチ(概要 / タスク詳細) ----
+function render(){
+  updateControlsVisibility();
+  if(VIEW==='overview'){
+    $('#projHeader').innerHTML = '';
+    renderOverview();
+  }else{
+    renderProjectHeader();
+    renderTasks();
+  }
+  renderStats();
+}
+
+function updateControlsVisibility(){
+  const c = document.querySelector('.controls');
+  if(c) c.style.display = (VIEW==='overview') ? 'none' : '';
+}
+
+function priColor(priStr){
+  return (priStr && PRI_META[priStr]) ? PRI_META[priStr].color : 'var(--none)';
+}
+
+function ovCardHTML(p){
+  const s = statsFor(p.project);
+  const pct = s.total ? Math.round((s.done / s.total) * 100) : 0;
+  const color = priColor(p.priority);
+  const opts = ['','P1','P2','P3','P4'].map(v=>
+    `<option value="${v}" ${p.priority===v?'selected':''}>${v||'—'}</option>`
+  ).join('');
+  const goalInner = p.goal
+    ? esc(p.goal)
+    : `<span class="ov-goal-empty">+ ゴールを設定</span>`;
+  const openTop = DATA.tasks
+    .filter(t=>t.project===p.project && !t.checked && (t.priority===1 || t.priority===2))
+    .sort((a,b)=>(a.priority||9)-(b.priority||9))
+    .slice(0,2);
+  const previewHTML = openTop.length
+    ? openTop.map(t=>`<div class="ov-prev-item">${esc(t.text)||'(空)'}</div>`).join('')
+    : `<div class="ov-prev-item ov-prev-empty">未完了なし</div>`;
+  return `<div class="ov-card${p.is_root?' ov-root':''}" data-proj="${esc(p.project)}">
+    <div class="ov-spine" style="background:${color}"></div>
+    <div class="ov-body">
+      <div class="ov-head">
+        <div class="ov-name">${esc(p.project)}</div>
+        <select class="sb-sel ov-pri-sel" data-file="${esc(p.file)}" title="プロジェクト優先度">${opts}</select>
+      </div>
+      <div class="ov-goal" data-file="${esc(p.file)}">${goalInner}</div>
+      <div class="ov-progress"><div class="ov-progress-bar" style="width:${pct}%"></div></div>
+      <div class="ov-progress-label">${s.done}/${s.total} 完了</div>
+      <div class="ov-counts">
+        <span class="badge">未完了 ${s.open}</span>
+        <span class="badge${s.p1?' ov-count-alert':''}">🔴 P1:${s.p1}</span>
+        <span class="badge${s.overdue?' ov-count-alert':''}">⏰ 期限切れ:${s.overdue}</span>
+      </div>
+      <div class="ov-preview">${previewHTML}</div>
+    </div>
+  </div>`;
+}
+
+function renderOverview(){
+  const board = $('#board');
+  if(!DATA.projects.length){
+    board.innerHTML = '<div class="empty">プロジェクトが見つかりません。</div>';
+    return;
+  }
+  board.innerHTML = `<div class="ov-grid">${DATA.projects.map(ovCardHTML).join('')}</div>`;
+  wireOverview();
+}
+
+function wireOverview(){
+  document.querySelectorAll('.ov-card').forEach(card=>{
+    const name = card.dataset.proj;
+    card.addEventListener('click', ()=>selectProject(name));
+
+    const sel = card.querySelector('.ov-pri-sel');
+    sel.addEventListener('click', e=>e.stopPropagation());
+    sel.addEventListener('change', async e=>{
+      e.stopPropagation();
+      const file = sel.dataset.file;
+      const priority = sel.value;
+      try{
+        await api('/api/update-project', {file, priority});
+        const proj = DATA.projects.find(pp=>pp.file===file);
+        if(proj) proj.priority = priority || null;
+        renderOverview();
+        renderSidebar();
+        toast('プロジェクト優先度を更新しました');
+      }catch(err){ toast('更新失敗: '+err.message, true); }
+    });
+
+    const goalEl = card.querySelector('.ov-goal');
+    goalEl.addEventListener('click', e=>{
+      e.stopPropagation();
+      const proj = DATA.projects.find(pp=>pp.file===goalEl.dataset.file);
+      if(proj) startGoalEdit(goalEl, proj);
+    });
+  });
+}
+
+function startGoalEdit(el, p){
+  if(el.querySelector('.ov-goal-input')) return;
+  const input = document.createElement('input');
+  input.className = 'ov-goal-input';
+  input.type = 'text';
+  input.maxLength = 200;
+  input.value = p.goal || '';
+  el.innerHTML = '';
+  el.appendChild(input);
+  input.focus(); input.select();
+  input.addEventListener('click', e=>e.stopPropagation());
+  const finish = async (save)=>{
+    if(save){
+      const val = input.value.trim();
+      if(val !== (p.goal||'')){
+        try{
+          await api('/api/update-project-goal', {file:p.file, goal:val});
+          p.goal = val || null;
+          toast('ゴールを更新しました');
+        }catch(e){ toast('更新失敗: '+e.message, true); renderOverview(); return; }
+      }
+    }
+    renderOverview();
+  };
+  input.addEventListener('keydown', e=>{
+    e.stopPropagation();
+    if(e.key==='Enter'){ e.preventDefault(); finish(true); }
+    if(e.key==='Escape'){ finish(false); }
+  });
+  input.addEventListener('blur', ()=>finish(true));
+}
+
+function renderProjectHeader(){
+  const host = $('#projHeader');
+  const p = FILTER.project ? DATA.projects.find(pp=>pp.project===FILTER.project) : null;
+  if(!p){ host.innerHTML = ''; return; }
+  const s = statsFor(p.project);
+  const pct = s.total ? Math.round((s.done / s.total) * 100) : 0;
+  host.innerHTML = `<div class="proj-header">
+    <button class="btn" id="backToOverview">← すべて</button>
+    <div class="proj-header-main">
+      <div class="proj-header-name">${esc(p.project)}</div>
+      ${p.goal ? `<div class="proj-header-goal">${esc(p.goal)}</div>` : ''}
+      <div class="ov-progress"><div class="ov-progress-bar" style="width:${pct}%"></div></div>
+      <div class="ov-progress-label">${s.done}/${s.total} 完了 · 未完了 ${s.open}${s.overdue?` · ⏰ 期限切れ ${s.overdue}`:''}</div>
+    </div>
+  </div>`;
+  $('#backToOverview').addEventListener('click', ()=>selectProject(''));
+}
+
+// ---- location.hash によるビュー状態の保持 ----
+function updateHash(){
+  let h;
+  if(VIEW==='overview') h = '#/overview';
+  else if(FILTER.project) h = '#/p/' + encodeURIComponent(FILTER.project);
+  else h = '#/tasks';
+  if(location.hash !== h) location.hash = h;
+}
+
+function restoreFromHash(){
+  const h = location.hash.replace(/^#/, '');
+  const m = h.match(/^\/p\/(.+)$/);
+  if(m){
+    const name = decodeURIComponent(m[1]);
+    if(DATA.projects.some(p=>p.project===name)){
+      VIEW = 'tasks'; FILTER.project = name; $('#project').value = name;
+      return;
+    }
+  }
+  if(h === '/tasks'){
+    VIEW = 'tasks'; FILTER.project = ''; $('#project').value = '';
+    return;
+  }
+  VIEW = 'overview'; FILTER.project = ''; $('#project').value = '';
+}
+
+function syncViewSeg(){
+  document.querySelectorAll('#viewSeg button').forEach(b=>{
+    b.classList.toggle('on', b.dataset.v===VIEW);
+  });
+}
+
+function updateAddProjectSelection(){
+  if(VIEW==='tasks' && FILTER.project){
+    const p = DATA.projects.find(pp=>pp.project===FILTER.project);
+    if(p) $('#addProject').value = p.file;
+  }
+}
+
 function taskById(id){ return DATA.tasks.find(t=>t.id===id); }
 
-// 行データから raw 文字列を再構成(サーバの format と同じ規則)
+// 行データから raw 文字列を再構成(サーバの format_task_line と同じ規則)
 function buildRaw(t){
-  let raw = `- [${t.checked?'x':' '}] `;
+  const indent = t.indent || '';
+  const bullet = t.bullet || '-';
+  let raw = `${indent}${bullet} [${t.checked?'x':' '}] `;
   if(t.priority) raw += `(P${t.priority}) `;
   raw += (t.text||'');
   if(t.due) raw += ` <!-- due:${t.due} -->`;
@@ -717,13 +1032,13 @@ function wire(){
 
     row.querySelector('.check').addEventListener('change', async e=>{
       const ok = await mutate(t, {checked:e.target.checked});
-      if(ok){ renderStats(); render(); }
+      if(ok){ render(); renderSidebar(); }
     });
 
     row.querySelector('.prisel select').addEventListener('change', async e=>{
       const v = e.target.value ? parseInt(e.target.value,10) : null;
       const ok = await mutate(t, {priority:v});
-      if(ok){ renderStats(); render(); }
+      if(ok){ render(); renderSidebar(); }
     });
 
     row.querySelector('.del').addEventListener('click', async ()=>{
@@ -731,7 +1046,7 @@ function wire(){
       try{
         await api('/api/delete', {file:t.file, old_raw:t.raw});
         DATA.tasks = DATA.tasks.filter(x=>x.id!==id);
-        renderStats(); render(); toast('削除しました');
+        render(); renderSidebar(); toast('削除しました');
       }catch(e){ toast('削除失敗: '+e.message, true); await load(); }
     });
 
@@ -754,7 +1069,7 @@ function wire(){
       const newPri = parseInt(g.dataset.pri,10) || null;
       if((t.priority||0)===(newPri||0)) return;
       const ok = await mutate(t, {priority:newPri});
-      if(ok){ renderStats(); render();
+      if(ok){ render(); renderSidebar();
         const moved = document.querySelector(`.row[data-id="${CSS.escape(id)}"]`);
         if(moved) moved.classList.add('saved');
       }
@@ -797,6 +1112,25 @@ document.querySelectorAll('#statusSeg button').forEach(b=>{
     document.querySelectorAll('#statusSeg button').forEach(x=>x.classList.remove('on'));
     b.classList.add('on'); FILTER.status=b.dataset.s; render();
   });
+});
+document.querySelectorAll('#viewSeg button').forEach(b=>{
+  b.addEventListener('click', ()=>{
+    VIEW = b.dataset.v;
+    if(VIEW==='overview'){ FILTER.project=''; $('#project').value=''; }
+    syncViewSeg();
+    updateHash();
+    renderSidebar();
+    render();
+    updateAddProjectSelection();
+  });
+});
+window.addEventListener('hashchange', ()=>{
+  if(!DATA.projects.length) return;
+  restoreFromHash();
+  syncViewSeg();
+  renderSidebar();
+  render();
+  updateAddProjectSelection();
 });
 
 async function doAdd(){
@@ -842,17 +1176,21 @@ const PRI_META = {
 
 function selectProject(name){
   FILTER.project = name;
+  VIEW = name ? 'tasks' : 'overview';
   $('#project').value = name;
+  syncViewSeg();
+  updateHash();
   renderSidebar();
   render();
+  updateAddProjectSelection();
 }
 
 function renderSidebar(){
   const list = $('#sb-list');
-  const allActive = !FILTER.project;
+  const allActive = VIEW==='overview';
   let html = `<div class="sb-all${allActive?' on':''}" id="sb-all">すべて</div>`;
   for(const p of DATA.projects){
-    const active = FILTER.project === p.project;
+    const active = VIEW==='tasks' && FILTER.project === p.project;
     const pri = p.priority ? PRI_META[p.priority] : null;
     const dot = pri
       ? `<span class="sb-dot" style="background:${pri.color}"></span>`
@@ -860,12 +1198,16 @@ function renderSidebar(){
     const opts = ['','P1','P2','P3','P4'].map(v=>
       `<option value="${v}" ${p.priority===v?'selected':''}>${v||'—'}</option>`
     ).join('');
+    const s = statsFor(p.project);
+    const pct = s.total ? Math.round((s.done / s.total) * 100) : 0;
     html += `<div class="sb-item${active?' on':''}" data-proj="${esc(p.project)}">
       <div class="sb-name">${esc(p.project)}</div>
       <div class="sb-pri">${dot}
         <select class="sb-sel" data-file="${esc(p.file)}" data-proj="${esc(p.project)}"
                 title="プロジェクト優先度">${opts}</select>
+        <span class="sb-open-count">未完了 ${s.open}</span>
       </div>
+      <div class="sb-bar"><div class="sb-bar-fill" style="width:${pct}%"></div></div>
     </div>`;
   }
   list.innerHTML = html;
@@ -887,6 +1229,7 @@ function renderSidebar(){
         const proj = DATA.projects.find(p=>p.file===file);
         if(proj) proj.priority = priority || null;
         renderSidebar();
+        if(VIEW==='overview') renderOverview();
         toast('プロジェクト優先度を更新しました');
       }catch(err){ toast('更新失敗: '+err.message, true); }
     });

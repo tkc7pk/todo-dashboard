@@ -68,6 +68,10 @@ class TestParseFormatRoundtrip(unittest.TestCase):
         for n in range(1, 5):
             self._check(f"- [ ] (P{n}) task")
 
+    def test_deep_nested_with_due(self):
+        """深いネスト + 期限あり（JS の buildRaw 修正の回帰確認: indent/bullet が失われないこと）"""
+        self._check("    - [ ] (P2) deeply nested with due <!-- due:2026-12-01 -->")
+
     def test_checked_state_preserved(self):
         """完了 / 未完了の両方が正しく往復する"""
         self._check("- [x] done item")
@@ -247,6 +251,18 @@ class TestParseFrontmatter(unittest.TestCase):
         self.assertEqual(fm["project"], "Foo")
         self.assertIsNone(fm["priority"])
 
+    def test_extracts_goal(self):
+        fm = self._fm("---\nproject: X\ngoal: これはゴールです\n---\n")
+        self.assertEqual(fm["goal"], "これはゴールです")
+
+    def test_goal_missing_returns_none(self):
+        fm = self._fm("---\nproject: X\npriority: P2\n---\n")
+        self.assertIsNone(fm["goal"])
+
+    def test_goal_quotes_stripped(self):
+        fm = self._fm('---\ngoal: "quoted goal"\n---\n')
+        self.assertEqual(fm["goal"], "quoted goal")
+
 
 # ---------------------------------------------------------------------------
 # update_project_priority — フロントマター書き込み
@@ -301,6 +317,146 @@ class TestProjectPriority(unittest.TestCase):
             td.update_project_priority(str(self.todo), "P5")
         with self.assertRaises(ValueError):
             td.update_project_priority(str(self.todo), "high")
+
+
+# ---------------------------------------------------------------------------
+# update_project_goal — フロントマター書き込み(ゴール)
+# ---------------------------------------------------------------------------
+
+class TestProjectGoal(unittest.TestCase):
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmpdir.name).resolve()
+        self._patch = patch.object(td, "ROOT", self.root)
+        self._patch.start()
+        self.todo = self.root / "proj" / "TODO.md"
+        self.todo.parent.mkdir(parents=True)
+
+    def tearDown(self):
+        self._patch.stop()
+        self._tmpdir.cleanup()
+
+    def _write(self, content):
+        self.todo.write_text(content, encoding="utf-8")
+
+    def _read(self):
+        return self.todo.read_text(encoding="utf-8")
+
+    def test_inserts_goal_into_existing_frontmatter(self):
+        """既存フロントマターに goal: が無ければ新規挿入される"""
+        self._write("---\nproject: X\n---\n- [ ] task\n")
+        td.update_project_goal(str(self.todo), "新しいゴール")
+        self.assertIn("goal: 新しいゴール", self._read())
+
+    def test_updates_existing_goal(self):
+        """既存の goal: を別の値に更新できる"""
+        self._write("---\nproject: X\ngoal: old goal\n---\n- [ ] task\n")
+        td.update_project_goal(str(self.todo), "new goal")
+        content = self._read()
+        self.assertIn("goal: new goal", content)
+        self.assertNotIn("old goal", content)
+
+    def test_removes_goal_when_empty(self):
+        """空文字を渡すと goal: 行が削除される"""
+        self._write("---\nproject: X\ngoal: to be removed\n---\n- [ ] task\n")
+        td.update_project_goal(str(self.todo), "")
+        self.assertNotIn("goal:", self._read())
+
+    def test_creates_frontmatter_when_absent(self):
+        """フロントマターなしのファイルに goal を書くと先頭に挿入される"""
+        self._write("- [ ] task\n")
+        td.update_project_goal(str(self.todo), "fresh goal")
+        content = self._read()
+        self.assertTrue(content.startswith("---"))
+        self.assertIn("goal: fresh goal", content)
+
+    def test_newline_raises(self):
+        """改行を含む goal は ValueError"""
+        self._write("---\nproject: X\n---\n")
+        with self.assertRaises(ValueError):
+            td.update_project_goal(str(self.todo), "line1\nline2")
+
+    def test_over_200_chars_raises(self):
+        """201文字以上の goal は ValueError"""
+        self._write("---\nproject: X\n---\n")
+        with self.assertRaises(ValueError):
+            td.update_project_goal(str(self.todo), "a" * 201)
+
+
+# ---------------------------------------------------------------------------
+# scan — projects[].stats / is_root / ソート順
+# ---------------------------------------------------------------------------
+
+class TestScanProjectStats(unittest.TestCase):
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmpdir.name).resolve()
+        self._patch = patch.object(td, "ROOT", self.root)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        self._tmpdir.cleanup()
+
+    def test_project_stats_is_root_and_sort_order(self):
+        # root 直下の「全体」TODO（is_root のはず）
+        (self.root / "TODO.md").write_text(
+            "---\nproject: 全体\npriority: P2\n---\n"
+            "- [ ] (P1) root task overdue <!-- due:2020-01-01 -->\n"
+            "- [x] (P3) root done\n",
+            encoding="utf-8",
+        )
+        # サブプロジェクト A（優先度 P1）
+        a_dir = self.root / "proj-a"
+        a_dir.mkdir()
+        (a_dir / "TODO.md").write_text(
+            "---\nproject: ProjA\npriority: P1\n---\n"
+            "- [ ] (P1) a task1\n"
+            "- [ ] (P2) a task2\n"
+            "- [x] a task3 done\n",
+            encoding="utf-8",
+        )
+        # サブプロジェクト B（優先度未設定・フロントマターなし）
+        b_dir = self.root / "proj-b"
+        b_dir.mkdir()
+        (b_dir / "TODO.md").write_text("- [ ] b task open\n", encoding="utf-8")
+
+        data = td.scan(self.root)
+        projects = {p["project"]: p for p in data["projects"]}
+
+        # is_root
+        self.assertTrue(projects["全体"]["is_root"])
+        self.assertFalse(projects["ProjA"]["is_root"])
+        self.assertFalse(projects["proj-b"]["is_root"])
+
+        # stats: 全体（total/open/done/p1/overdue）
+        root_stats = projects["全体"]["stats"]
+        self.assertEqual(root_stats["total"], 2)
+        self.assertEqual(root_stats["open"], 1)
+        self.assertEqual(root_stats["done"], 1)
+        self.assertEqual(root_stats["p1"], 1)
+        self.assertEqual(root_stats["overdue"], 1)
+
+        # stats: ProjA
+        a_stats = projects["ProjA"]["stats"]
+        self.assertEqual(a_stats["total"], 3)
+        self.assertEqual(a_stats["open"], 2)
+        self.assertEqual(a_stats["done"], 1)
+        self.assertEqual(a_stats["p1"], 1)
+        self.assertEqual(a_stats["overdue"], 0)
+
+        # stats: proj-b（優先度未設定タスク1件、期限なし）
+        b_stats = projects["proj-b"]["stats"]
+        self.assertEqual(b_stats["total"], 1)
+        self.assertEqual(b_stats["open"], 1)
+        self.assertEqual(b_stats["none"], 1)
+
+        # ソート順: is_root -> priority(未設定は最後) -> 名前
+        order = [p["project"] for p in data["projects"]]
+        self.assertEqual(order[0], "全体")
+        self.assertLess(order.index("ProjA"), order.index("proj-b"))
 
 
 # ---------------------------------------------------------------------------
