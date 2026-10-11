@@ -39,6 +39,41 @@ python todo_dashboard.py --port 8765 --no-browser
 
 `http://127.0.0.1:8765/` で UI が開く。`Ctrl+C` で停止。
 
+### 常駐運用(https://todo.naozi.jp)の起動・再起動
+
+公開構成: 外部 → Cloudflare Access(OTP) → Cloudflare Tunnel(Windowsサービス `cloudflared`) →
+`127.0.0.1:8765`(タスクスケジューラ「TodoDashboard」が起動する `pythonw.exe`)。
+
+- 登録内容: `pythonw.exe F:\claude\todo-dashboard\todo_dashboard.py --root F:\claude --no-browser --require-cf-access`
+  / トリガー=ログオン時 / `ExecutionTimeLimit=PT0S`(無制限。PT72Hのままだと3日で強制終了され502になる)
+- **`todo_dashboard.py` を変更・master 更新した後は再起動しないと反映されない**(常駐プロセスは起動時のコードのまま)
+
+**再起動(通常はこれだけ。管理者権限不要)** — PowerShell:
+
+```powershell
+Stop-ScheduledTask -TaskName TodoDashboard
+Get-CimInstance Win32_Process -Filter "Name='pythonw.exe'" |
+  Where-Object { $_.CommandLine -like '*todo_dashboard.py*' } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }   # 子プロセスが残る場合の保険
+Start-ScheduledTask -TaskName TodoDashboard
+```
+
+**起動のみ**(停止中・502のとき): `Start-ScheduledTask -TaskName TodoDashboard`
+
+**確認**:
+
+```powershell
+Get-ScheduledTask -TaskName TodoDashboard | Select-Object State          # Running ならOK
+Get-NetTCPConnection -LocalPort 8765 -State Listen                       # 待受確認
+Get-Service cloudflared                                                  # Running / Automatic
+```
+
+- 手動で一時起動したい場合は上の「起動方法」のコマンドを使う(ポート衝突を避けるため、先にタスクを停止する)
+- `cloudflared` 側の再起動は**管理者PowerShell**が必要: `Restart-Service cloudflared`
+- 再起動後も 502 のままなら、`cloudflared` が Running か、`curl http://127.0.0.1:8765/` が(`Cf-Access-Jwt-Assertion`
+  ヘッダー無しだと403になる点に注意)応答するかを切り分ける
+- 別プロジェクトの同種タスクを作るときも `ExecutionTimeLimit` を `PT0S` にすること
+
 ### Discord通知モード
 
 ```
