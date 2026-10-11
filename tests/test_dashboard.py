@@ -7,8 +7,12 @@ tests/test_dashboard.py — unittest スモークテスト
   - _check_target のセキュリティガード（範囲外・todo.md 以外を弾く）
 """
 
+import json
 import sys
 import tempfile
+import threading
+import urllib.error
+import urllib.request
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -547,6 +551,172 @@ class TestBuildDiscordSummary(unittest.TestCase):
         data = self._make_data([])
         result = td.build_discord_summary(data)
         self.assertIn("合計: 0件", result)
+
+
+# ---------------------------------------------------------------------------
+# hq 依頼タグ / 改行コード維持
+# ---------------------------------------------------------------------------
+
+TAG = "【hq依頼】"
+
+
+class TestSetHqTag(unittest.TestCase):
+
+    def test_on_with_priority(self):
+        self.assertEqual(td.set_hq_tag("- [ ] (P1) 本文", True), f"- [ ] (P1) {TAG} 本文")
+
+    def test_on_without_priority(self):
+        self.assertEqual(td.set_hq_tag("- [ ] 本文", True), f"- [ ] {TAG} 本文")
+
+    def test_on_is_idempotent(self):
+        once = td.set_hq_tag("- [ ] (P2) 本文", True)
+        self.assertEqual(td.set_hq_tag(once, True), once)
+        self.assertEqual(once.count(TAG), 1)
+
+    def test_off_restores_original(self):
+        for raw in ["- [ ] (P1) 本文", "- [ ] 本文", "  * [ ] (P3) ネスト"]:
+            self.assertEqual(td.set_hq_tag(td.set_hq_tag(raw, True), False), raw)
+
+    def test_off_without_tag_is_noop(self):
+        self.assertEqual(td.set_hq_tag("- [ ] (P1) 本文", False), "- [ ] (P1) 本文")
+
+    def test_keeps_other_tags(self):
+        raw = "- [ ] (P1) 【承認済 D-2026-10-01】実装 (PR: https://x/pull/1) <!-- due:2026-10-20 -->"
+        on = td.set_hq_tag(raw, True)
+        self.assertEqual(on, raw.replace("(P1) ", f"(P1) {TAG} ", 1))
+        self.assertEqual(td.set_hq_tag(on, False), raw)
+
+    def test_completed_line_rejected_on_but_off_allowed(self):
+        with self.assertRaises(ValueError):
+            td.set_hq_tag("- [x] (P1) 済み", True)
+        self.assertEqual(td.set_hq_tag(f"- [x] (P1) {TAG} 済み", False), "- [x] (P1) 済み")
+
+    def test_non_task_line_rejected(self):
+        with self.assertRaises(ValueError):
+            td.set_hq_tag("# 見出し", True)
+
+    def test_parse_hq_request_flag(self):
+        self.assertTrue(td.parse_task_line(f"- [ ] (P1) {TAG} 本文")["hq_request"])
+        self.assertTrue(td.parse_task_line(f"- [ ] {TAG} 本文")["hq_request"])
+        self.assertFalse(td.parse_task_line("- [ ] (P1) 本文")["hq_request"])
+        t = td.parse_task_line(f"- [ ] (P1) {TAG} 本文 <!-- due:2026-10-20 -->")
+        self.assertEqual(td.format_task_line(t), f"- [ ] (P1) {TAG} 本文 <!-- due:2026-10-20 -->")
+
+
+class TestHqFileOps(unittest.TestCase):
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmpdir.name).resolve()
+        self._patch = patch.object(td, "ROOT", self.root)
+        self._patch.start()
+        self.todo = self.root / "proj" / "TODO.md"
+        self.todo.parent.mkdir(parents=True)
+
+    def tearDown(self):
+        self._patch.stop()
+        self._tmpdir.cleanup()
+
+    def _w(self, data):
+        self.todo.write_bytes(data.encode("utf-8"))
+
+    def _r(self):
+        return self.todo.read_bytes().decode("utf-8")
+
+    def test_set_hq_request_roundtrip_lf(self):
+        self._w("- [ ] (P1) a\n- [ ] b\n")
+        new = td.set_hq_request(str(self.todo), "- [ ] (P1) a", True)
+        self.assertEqual(new, f"- [ ] (P1) {TAG} a")
+        self.assertEqual(self._r(), f"- [ ] (P1) {TAG} a\n- [ ] b\n")
+        td.set_hq_request(str(self.todo), new, False)
+        self.assertEqual(self._r(), "- [ ] (P1) a\n- [ ] b\n")
+
+    def test_lf_file_stays_lf(self):
+        self._w("---\nproject: x\n---\n- [ ] a\n")
+        td.update_line(str(self.todo), "- [ ] a", "- [x] a")
+        td.add_task(str(self.todo), "n", None)
+        td.update_project_goal(str(self.todo), "g")
+        td.update_project_priority(str(self.todo), "P1")
+        self.assertNotIn("\r", self._r())
+
+    def test_crlf_file_stays_crlf(self):
+        self._w("---\r\nproject: x\r\n---\r\n- [ ] a\r\n- [ ] b\r\n")
+        td.set_hq_request(str(self.todo), "- [ ] a", True)
+        td.add_task(str(self.todo), "n", 2, hq=True)
+        td.update_project_goal(str(self.todo), "g")
+        td.delete_line(str(self.todo), "- [ ] b")
+        data = self._r()
+        self.assertEqual(data.count("\n"), data.count("\r\n"))
+        self.assertIn(f"- [ ] {TAG} a\r\n", data)
+
+    def test_mixed_eol_preserved_per_line(self):
+        self._w("- [ ] a\r\n- [ ] b\n- [ ] c\r\n")
+        td.update_line(str(self.todo), "- [ ] b", "- [x] b")
+        self.assertEqual(self._r(), "- [ ] a\r\n- [x] b\n- [ ] c\r\n")
+
+    def test_add_task_hq(self):
+        self._w("- [ ] existing\n")
+        self.assertEqual(td.add_task(str(self.todo), "新規", 1, hq=True), f"- [ ] (P1) {TAG} 新規")
+        self.assertEqual(td.add_task(str(self.todo), "新規2", None, hq=True), f"- [ ] {TAG} 新規2")
+        self.assertEqual(td.add_task(str(self.todo), "通常", None), "- [ ] 通常")
+
+    def test_hq_request_outside_root_rejected(self):
+        with self.assertRaises(ValueError):
+            td.set_hq_request(str(self.root.parent / "TODO.md"), "- [ ] a", True)
+
+    def test_scan_exposes_hq_request(self):
+        self._w(f"- [ ] {TAG} a\n- [ ] b\n")
+        tasks = td.scan(self.root)["tasks"]
+        self.assertEqual([t["hq_request"] for t in tasks], [True, False])
+
+
+class TestHqApi(unittest.TestCase):
+
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmpdir.name).resolve()
+        self._patch = patch.object(td, "ROOT", self.root)
+        self._patch.start()
+        self.todo = self.root / "proj" / "TODO.md"
+        self.todo.parent.mkdir(parents=True)
+        self.todo.write_bytes("- [ ] (P1) a\n- [x] done\n".encode("utf-8"))
+        self.server = td.ThreadingHTTPServer(("127.0.0.1", 0), td.Handler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self._patch.stop()
+        self._tmpdir.cleanup()
+
+    def _post(self, path, body):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}", data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read())
+
+    def test_hq_request_on_off(self):
+        f = str(self.todo)
+        st, j = self._post("/api/hq-request", {"file": f, "old_raw": "- [ ] (P1) a", "on": True})
+        self.assertEqual(st, 200)
+        self.assertEqual(j["new_raw"], f"- [ ] (P1) {TAG} a")
+        st, j = self._post("/api/hq-request", {"file": f, "old_raw": j["new_raw"], "on": False})
+        self.assertEqual(j["new_raw"], "- [ ] (P1) a")
+        self.assertNotIn(b"\r", self.todo.read_bytes())
+
+    def test_hq_request_completed_rejected(self):
+        st, j = self._post("/api/hq-request", {"file": str(self.todo), "old_raw": "- [x] done", "on": True})
+        self.assertEqual(st, 400)
+        self.assertIn("error", j)
+
+    def test_api_add_hq(self):
+        st, j = self._post("/api/add", {"file": str(self.todo), "text": "x", "priority": None, "hq": True})
+        self.assertEqual(j["new_raw"], f"- [ ] {TAG} x")
 
 
 if __name__ == "__main__":

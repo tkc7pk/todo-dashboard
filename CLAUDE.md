@@ -111,14 +111,16 @@ goal: プロジェクトのゴール   # 省略可。改行不可・200文字以
   - `GET /api/scan` … `{root, projects, tasks, analysis, stats}` を返す
   - `POST /api/update` … `{file, old_raw, new_raw}` で1行を置換
   - `POST /api/delete` … `{file, old_raw}` で1行を削除
-  - `POST /api/add` … `{file, text, priority}` で末尾に1行追加
+  - `POST /api/add` … `{file, text, priority, hq?}` で末尾に1行追加（`hq: true` で `【hq依頼】` を付ける）
+  - `POST /api/hq-request` … `{file, old_raw, on}` で行に `【hq依頼】` を付け外しし `new_raw` を返す（`set_hq_tag` が純関数。完了行への `on` は拒否）
   - `POST /api/update-project` … `{file, priority}` でフロントマターの `priority:` を更新
   - `POST /api/update-project-goal` … `{file, goal}` でフロントマターの `goal:` を更新（空文字で削除）
 - フロントマター書き込みの共通処理: `_update_frontmatter_field(file_str, key, value)`。
   `update_project_priority` と `update_project_goal` はいずれもこの薄いラッパー。
 - 書き戻しの同定方式: **行番号ではなく `old_raw` の完全一致**で対象行を探す（インデックスずれに強い）。
   元の行が見つからなければ保存せずエラーを返し、UI 側は再読込を促す。
-- 改行コード（CRLF/LF）は元の行のものを維持する。
+- 改行コード（CRLF/LF）は元の行のものを維持する。読み書きは `_read_text` / `_write_text`（`newline=""`）を通し、Windows でも LF が CRLF に化けない。追加行・フロントマター挿入はファイル先頭の改行コードに合わせる。
+- `【hq依頼】`（`HQ_TAG`）: hq（本社）に拾わせる目印。優先度表記の直後に半角スペース1つを挟んで入れる（優先度なしならチェックボックス直後）。文字列と位置は hq 側と共通の取り決めなので変えない。`scan` の各タスクに `hq_request`(bool) が付く。
 
 ## 5. セキュリティ上の不変条件（緩めないこと）
 
@@ -148,7 +150,7 @@ goal: プロジェクトのゴール   # 省略可。改行不可・200文字以
   python -m unittest discover -s tests -v
   ```
   `tests/test_dashboard.py` が §3 の3パターン（優先度＋期限あり / ネスト＋完了 / 優先度なし）や
-  `goal:` の読み書き・`scan` のプロジェクト集計を含む53ケースをカバーしている（2026-09時点）。
+  `goal:` の読み書き・`scan` のプロジェクト集計と hq 依頼タグ・改行コード維持を含む72ケースをカバーしている（2026-09時点）。
   パーサや書き込み関数を触ったら必ずテストを通すこと。
 - 仕様（§2〜§5）を変えたら、**この CLAUDE.md を同じコミットで更新**する。ドキュメントと実装を乖離させない。
 - 大きめの変更後は `/security-review` を実行して書き込みガード・入力エスケープの退行がないか確認する。
