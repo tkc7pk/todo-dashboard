@@ -44,6 +44,8 @@ TASK_RE = re.compile(r"^(?P<indent>\s*)(?P<bullet>[-*+])\s+\[(?P<check>[ xX])\]\
 PRI_RE = re.compile(r"^\(\s*[Pp](?P<n>[1-4])\s*\)\s*")
 DUE_RE = re.compile(r"\s*<!--\s*due:\s*(?P<due>\d{4}-\d{2}-\d{2})\s*-->\s*")
 
+HQ_TAG = "【hq依頼】"  # hq 側と共通の目印。文字列と位置(優先度の直後)を変えないこと
+
 ROOT = Path(".").resolve()
 REQUIRE_CF_ACCESS = False
 
@@ -80,6 +82,7 @@ def parse_task_line(line):
         "priority": pri,
         "text": text,
         "due": due,
+        "hq_request": text.startswith(HQ_TAG),
     }
 
 
@@ -171,7 +174,7 @@ def scan(root):
     tasks = []
     for f in sorted(iter_todo_files(root)):
         try:
-            raw = f.read_text(encoding="utf-8", errors="replace")
+            raw = _read_text(f)
         except Exception:
             continue
         lines = raw.splitlines()
@@ -200,6 +203,7 @@ def scan(root):
                 "priority": t["priority"],
                 "text": t["text"],
                 "due": t["due"],
+                "hq_request": t["hq_request"],
                 "indent": t["indent"],
                 "bullet": t["bullet"],
                 "raw": line,
@@ -260,39 +264,98 @@ def _check_target(file_str):
     return p
 
 
+def _read_text(p):
+    """改行を変換せずに読む(CRLF/LF を行ごとにそのまま保つため)。"""
+    with open(p, "r", encoding="utf-8", errors="replace", newline="") as fh:
+        return fh.read()
+
+
+def _write_text(p, text):
+    """改行を変換せずに書く(Windows で LF が CRLF に化けるのを防ぐ)。"""
+    with open(p, "w", encoding="utf-8", newline="") as fh:
+        fh.write(text)
+
+
+def _detect_eol(content):
+    """ファイル内の最初の改行コードを返す(無ければ LF)。"""
+    i = content.find("\n")
+    return "\r\n" if i > 0 and content[i - 1] == "\r" else "\n"
+
+
+_HQ_PREFIX_RE = re.compile(
+    r"^(?P<head>\s*[-*+]\s+\[(?P<check>[ xX])\]\s*)(?P<pri>\(\s*[Pp][1-4]\s*\)\s*)?(?P<rest>.*)$")
+
+
+def set_hq_tag(raw, on):
+    """1行の raw に HQ_TAG を付ける/外す純関数。冪等。
+    付与位置は優先度表記の直後(無ければチェックボックスの直後)。
+    外すときはタグと直後の半角スペース1つだけを取り除く。"""
+    m = _HQ_PREFIX_RE.match(raw)
+    if not m:
+        raise ValueError("タスク行ではありません")
+    head, pri, rest = m.group("head"), m.group("pri") or "", m.group("rest")
+    has = rest.startswith(HQ_TAG)
+    if on:
+        if m.group("check").lower() == "x":
+            raise ValueError("完了済みのタスクは hq 依頼にできません")
+        if has:
+            return raw
+        lead = head + pri
+        if not lead[-1:].isspace():
+            lead += " "
+        return lead + HQ_TAG + " " + rest
+    if not has:
+        return raw
+    after = rest[len(HQ_TAG):]
+    if after.startswith(" "):
+        after = after[1:]
+    return head + pri + after
+
+
+def set_hq_request(file_str, old_raw, on):
+    """old_raw の行にタグを付け外しして書き戻し、新しい raw を返す。"""
+    new_raw = set_hq_tag(old_raw.rstrip("\r\n"), bool(on))
+    update_line(file_str, old_raw, new_raw)
+    return new_raw
+
+
 def update_line(file_str, old_raw, new_raw):
     p = _check_target(file_str)
-    text = p.read_text(encoding="utf-8", errors="replace")
+    text = _read_text(p)
     lines = text.splitlines(keepends=True)
     for i, line in enumerate(lines):
         if line.rstrip("\n").rstrip("\r") == old_raw.rstrip("\n").rstrip("\r"):
             nl = "\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else "")
             lines[i] = new_raw + nl
-            p.write_text("".join(lines), encoding="utf-8")
+            _write_text(p, "".join(lines))
             return True
     raise ValueError("元の行が見つかりませんでした(外部で編集された可能性)。更新して再試行してください")
 
 
 def delete_line(file_str, old_raw):
     p = _check_target(file_str)
-    text = p.read_text(encoding="utf-8", errors="replace")
+    text = _read_text(p)
     lines = text.splitlines(keepends=True)
     for i, line in enumerate(lines):
         if line.rstrip("\n").rstrip("\r") == old_raw.rstrip("\n").rstrip("\r"):
             del lines[i]
-            p.write_text("".join(lines), encoding="utf-8")
+            _write_text(p, "".join(lines))
             return True
     raise ValueError("元の行が見つかりませんでした")
 
 
-def add_task(file_str, text, priority):
+def add_task(file_str, text, priority, hq=False):
     p = _check_target(file_str)
-    content = p.read_text(encoding="utf-8", errors="replace")
+    content = _read_text(p)
+    body = text.strip()
+    if hq and not body.startswith(HQ_TAG):
+        body = HQ_TAG + " " + body
     t = {"indent": "", "bullet": "-", "checked": False,
-         "priority": int(priority) if priority else None, "text": text.strip(), "due": None}
+         "priority": int(priority) if priority else None, "text": body, "due": None}
     new_line = format_task_line(t)
-    sep = "" if content.endswith("\n") or content == "" else "\n"
-    p.write_text(content + sep + new_line + "\n", encoding="utf-8")
+    eol = _detect_eol(content)
+    sep = "" if content.endswith("\n") or content == "" else eol
+    _write_text(p, content + sep + new_line + eol)
     return new_line
 
 
@@ -303,7 +366,7 @@ def _update_frontmatter_field(file_str, key, value):
     """
     value = value or ""
     p = _check_target(file_str)
-    content = p.read_text(encoding="utf-8", errors="replace")
+    content = _read_text(p)
     lines = content.splitlines(keepends=True)
     key_re = re.compile(r"\s*" + re.escape(key) + r"\s*:")
 
@@ -322,20 +385,21 @@ def _update_frontmatter_field(file_str, key, value):
                     idx = i
                     break
             if value:
-                new_line = f"{key}: {value}\n"
+                new_line = f"{key}: {value}" + _detect_eol(content)
                 if idx is not None:
                     lines[idx] = new_line
                 else:
                     lines.insert(close, new_line)
             elif idx is not None:
                 del lines[idx]
-            p.write_text("".join(lines), encoding="utf-8")
+            _write_text(p, "".join(lines))
             return
 
     # フロントマターなし → 先頭に新規ブロックを挿入
     if value:
-        header = f"---\n{key}: {value}\n---\n"
-        p.write_text(header + content, encoding="utf-8")
+        eol = _detect_eol(content)
+        header = f"---{eol}{key}: {value}{eol}---{eol}"
+        _write_text(p, header + content)
 
 
 def update_project_priority(file_str, priority):
@@ -415,8 +479,11 @@ class Handler(BaseHTTPRequestHandler):
                 delete_line(body["file"], body["old_raw"])
                 self._send_json({"ok": True})
             elif self.path == "/api/add":
-                new_line = add_task(body["file"], body["text"], body.get("priority"))
+                new_line = add_task(body["file"], body["text"], body.get("priority"), bool(body.get("hq")))
                 self._send_json({"ok": True, "new_raw": new_line})
+            elif self.path == "/api/hq-request":
+                new_raw = set_hq_request(body["file"], body["old_raw"], bool(body.get("on")))
+                self._send_json({"ok": True, "new_raw": new_raw})
             elif self.path == "/api/update-project":
                 update_project_priority(body["file"], body.get("priority", ""))
                 self._send_json({"ok": True})
@@ -528,6 +595,14 @@ PAGE = r"""<!doctype html>
   .del{flex:0 0 auto;margin:9px 8px 0 0;background:transparent;border:0;color:var(--faint);
        font-size:14px;padding:2px 6px;border-radius:5px}
   .del:hover{color:var(--p1);background:var(--surface-2)}
+  .hqbtn{flex:0 0 auto;margin:9px 4px 0 0;background:transparent;border:1px solid var(--border-soft);
+         color:var(--faint);font-family:var(--mono);font-size:11px;padding:1px 7px;border-radius:5px}
+  .hqbtn:hover{color:var(--text);background:var(--surface-2)}
+  .hqbtn[aria-pressed="true"]{color:var(--accent);border-color:var(--accent);background:var(--accent-soft)}
+  .hqbtn:focus-visible{outline:1.5px solid var(--accent);outline-offset:1px}
+  .badge.hq{color:var(--accent);border-color:var(--accent);background:var(--accent-soft)}
+  .addbar label.hqchk{font-size:13px;color:var(--muted);display:flex;gap:5px;align-items:center;cursor:pointer}
+  .addbar label.hqchk input{accent-color:var(--accent)}
 
   .addbar{display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap}
   .addbar select,.addbar input{font-family:var(--sans);font-size:13px;color:var(--text);
@@ -656,6 +731,9 @@ PAGE = r"""<!doctype html>
       <button data-s="all">すべて</button>
       <button data-s="done">完了</button>
     </div>
+    <div class="seg" id="hqSeg">
+      <button type="button" id="hqOnly" aria-pressed="false" title="【hq依頼】が付いたタスクだけを表示します">hq依頼のみ</button>
+    </div>
   </div>
 
   <div id="projHeader"></div>
@@ -669,6 +747,7 @@ PAGE = r"""<!doctype html>
       <option value="3">P3</option><option value="4">P4</option>
     </select>
     <input type="text" id="addText" placeholder="新しいタスクを追加…(Enter)">
+    <label class="hqchk" title="タスクに【hq依頼】を付けて hq に通知対象にします"><input type="checkbox" id="addHq">hq に反映</label>
     <button class="btn" id="addBtn">追加</button>
   </div>
 
@@ -685,7 +764,8 @@ const PRIOS = [
   {key:0, label:'—',  name:'未設定', color:'var(--none)'},
 ];
 let DATA = {tasks:[], projects:[], stats:{}, root:''};
-let FILTER = {q:'', project:'', status:'open'};
+let FILTER = {q:'', project:'', status:'open', hqOnly:false};
+const HQ_TAG = '【hq依頼】';  // サーバの HQ_TAG と同一(変更禁止)
 let VIEW = 'overview';  // 'overview' | 'tasks'
 
 const $ = s => document.querySelector(s);
@@ -762,6 +842,7 @@ function visible(t){
   if(FILTER.status==='open' && t.checked) return false;
   if(FILTER.status==='done' && !t.checked) return false;
   if(FILTER.project && t.project!==FILTER.project) return false;
+  if(FILTER.hqOnly && !t.hq_request) return false;
   if(FILTER.q && !(t.text.toLowerCase().includes(FILTER.q) || t.project.toLowerCase().includes(FILTER.q))) return false;
   return true;
 }
@@ -773,6 +854,12 @@ function rowHTML(t){
   const color = (PRIOS.find(p=>p.key===pri)||PRIOS[4]).color;
   const overdue = t.due && !t.checked && t.due < today();
   const due = t.due ? `<span class="due ${overdue?'over':''}">📅 ${t.due}</span>` : '';
+  const hqBadge = t.hq_request ? '<span class="badge hq">hq依頼</span>' : '';
+  const showHq = !t.checked && t.project !== 'hq';  // hq 自身の TODO には出さない
+  const hqBtn = showHq
+    ? `<button class="hqbtn" type="button" aria-pressed="${t.hq_request?'true':'false'}" aria-label="hq に反映（${t.hq_request?'反映済み。押すと取り消し':'押すと依頼'}）" title="${t.hq_request?'hq への反映を取り消す':'hq に反映する'}">hq</button>`
+    : '';
+  const shownText = t.hq_request ? t.text.slice(HQ_TAG.length).replace(/^ /,'') : t.text;
   const src = `<span class="src">${esc(t.file.split(/[\\/]/).pop())}</span>`;
   const opts = [['','—'],['1','P1'],['2','P2'],['3','P3'],['4','P4']]
     .map(([v,l])=>`<option value="${v}" ${String(t.priority||'')===v?'selected':''}>${l}</option>`).join('');
@@ -781,11 +868,11 @@ function rowHTML(t){
     <div class="grip" title="ドラッグで優先度を変更">⋮⋮</div>
     <input type="checkbox" class="check" ${t.checked?'checked':''}>
     <div class="main">
-      <div class="txt" tabindex="0">${esc(t.text)||'<span style="color:var(--faint)">(空)</span>'}</div>
-      <div class="meta"><span class="badge">${esc(t.project)}</span>${due}${src}</div>
+      <div class="txt" tabindex="0">${esc(shownText)||'<span style="color:var(--faint)">(空)</span>'}</div>
+      <div class="meta"><span class="badge">${esc(t.project)}</span>${hqBadge}${due}${src}</div>
     </div>
     <div class="prisel"><select title="優先度">${opts}</select></div>
-    <button class="del" title="削除">✕</button>
+    ${hqBtn}<button class="del" title="削除">✕</button>
   </div>`;
 }
 
@@ -1015,6 +1102,7 @@ async function mutate(t, changes){
   try{
     await api('/api/update', {file:t.file, old_raw, new_raw});
     t.raw = new_raw;
+    t.hq_request = (t.text||'').startsWith(HQ_TAG);
     return true;
   }catch(e){
     Object.assign(t, {raw:old_raw});  // 楽観更新を巻き戻し
@@ -1039,6 +1127,19 @@ function wire(){
       const v = e.target.value ? parseInt(e.target.value,10) : null;
       const ok = await mutate(t, {priority:v});
       if(ok){ render(); renderSidebar(); }
+    });
+
+    const hqb = row.querySelector('.hqbtn');
+    if(hqb) hqb.addEventListener('click', async ()=>{
+      const on = !t.hq_request;
+      try{
+        const r = await api('/api/hq-request', {file:t.file, old_raw:t.raw, on});
+        t.raw = r.new_raw;
+        t.hq_request = on;
+        t.text = on ? HQ_TAG + ' ' + t.text : t.text.slice(HQ_TAG.length).replace(/^ /,'');
+        render(); renderSidebar();
+        toast(on ? 'hq に反映しました。次の daily(朝 8:00)で通知されます' : 'hq への反映を取り消しました');
+      }catch(e){ toast('hq 反映失敗: '+e.message, true); await load(); }
     });
 
     row.querySelector('.del').addEventListener('click', async ()=>{
@@ -1133,16 +1234,24 @@ window.addEventListener('hashchange', ()=>{
   updateAddProjectSelection();
 });
 
+$('#hqOnly').addEventListener('click', e=>{
+  FILTER.hqOnly = !FILTER.hqOnly;
+  e.currentTarget.classList.toggle('on', FILTER.hqOnly);
+  e.currentTarget.setAttribute('aria-pressed', String(FILTER.hqOnly));
+  render();
+});
+
 async function doAdd(){
   const file = $('#addProject').value;
   const text = $('#addText').value.trim();
   const pri = $('#addPri').value;
   if(!file || !text){ toast('プロジェクトとタスク内容を入力してください', true); return; }
   try{
-    await api('/api/add', {file, text, priority: pri||null});
+    const hq = $('#addHq').checked;
+    await api('/api/add', {file, text, priority: pri||null, hq});
     $('#addText').value='';
     await load();
-    toast('追加しました');
+    toast(hq ? 'hq に反映しました。次の daily(朝 8:00)で通知されます' : '追加しました');
   }catch(e){ toast('追加失敗: '+e.message, true); }
 }
 $('#addBtn').addEventListener('click', doAdd);
