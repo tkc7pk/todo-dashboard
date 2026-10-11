@@ -56,6 +56,11 @@ Discord通知（`--notify`）はP1/P2先頭5件＋P3/P4件数のみで全タス�
    直し方: 同じ画面から明示的に **One-Time PIN を追加**する必要がある
    （Google/Okta等と同列の選択肢として一覧にある）。
 
+## 承認済み・完了
+
+- [x] (P1) 【承認済 D-20260908-04】PR #1 を master にマージ済み(2026-09-11 23:09 UTC)。タスクスケジューラ TodoDashboard の master ベース再起動は別途確認要 (PR: https://github.com/tkc7pk/todo-dashboard/pull/1)
+- [ ] (P2) 【オーナー作業・要確認】上記PR #1マージに伴い、Windowsタスクスケジューラ「TodoDashboard」がmasterベース(feature/project-viewではなく)で再起動されているか未確認。オーナーに確認を依頼
+
 ## 改善候補
 
 - [x] (P1) スモークテストを `tests/` に整備（parse/format ラウンドトリップ＋update/delete/add＋ガードを stdlib `unittest` で）
